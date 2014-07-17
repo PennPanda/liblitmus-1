@@ -86,3 +86,13 @@ int null_call(cycles_t *timestamp)
 {
 	return syscall(__NR_null_call, timestamp);
 }
+
+int reservation_create(int rtype, void *config)
+{
+	return syscall(__NR_reservation_create, rtype, config);
+}
+
+int reservation_destroy(unsigned int reservation_id, int cpu)
+{
+	return syscall(__NR_reservation_destroy, reservation_id, cpu);
+}

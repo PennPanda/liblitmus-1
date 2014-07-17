@@ -416,6 +416,11 @@ int null_call(cycles_t *timestamp);
  */
 struct control_page* get_ctrl_page(void);
 
+int reservation_create(int rtype, void *config);
+
+int reservation_destroy(unsigned int reservation_id, int cpu);
+
+
 #ifdef __cplusplus
 }
 #endif
