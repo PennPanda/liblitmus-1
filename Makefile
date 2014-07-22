@@ -73,7 +73,7 @@ AR  := ${CROSS_COMPILE}${AR}
 
 all     = lib ${rt-apps}
 rt-apps = cycles base_task rt_launch rtspin release_ts measure_syscall \
-	  base_mt_task uncache runtests
+	  base_mt_task uncache runtests resctrl
 
 .PHONY: all lib clean dump-config TAGS tags cscope help doc
 
@@ -233,6 +233,9 @@ obj-release_ts = release_ts.o
 
 obj-measure_syscall = null_call.o
 lib-measure_syscall = -lm
+
+obj-resctrl = resctrl.o
+
 
 # ##############################################################################
 # Build everything that depends on liblitmus.
