@@ -96,3 +96,13 @@ int reservation_destroy(unsigned int reservation_id, int cpu)
 {
 	return syscall(__NR_reservation_destroy, reservation_id, cpu);
 }
+
+int set_mc2_task_param(pid_t pid, struct mc2_task *param)
+{
+	return syscall(__NR_set_mc2_task_param, pid, param);
+}
+
+int set_page_color(int cpu)
+{
+	return syscall(__NR_set_page_color, cpu);
+}

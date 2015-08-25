@@ -1,4 +1,5 @@
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,10 +9,15 @@
 #include <assert.h>
 #include <limits.h>
 
+
 #include "litmus.h"
 #include "common.h"
 
+#define PAGE_SIZE 4096
+#define NUM_ITEMS 8192
 
+int *pages;
+unsigned long *access_order;
 
 static void usage(char *error) {
 	fprintf(stderr, "Error: %s\n", error);
@@ -22,8 +28,9 @@ static void usage(char *error) {
 		"	rt_spin -l\n"
 		"\n"
 		"COMMON-OPTS = [-w] [-s SCALE]\n"
-		"              [-p PARTITION/CLUSTER [-z CLUSTER SIZE]] [-c CLASS]\n"
-		"              [-X LOCKING-PROTOCOL] [-L CRITICAL SECTION LENGTH] [-Q RESOURCE-ID]"
+		"              [-p PARTITION/CLUSTER [-z CLUSTER SIZE]] [-c CLASS] [-m CRITICALITY LEVEL]\n"
+		"              [-X LOCKING-PROTOCOL] [-L CRITICAL SECTION LENGTH] [-Q RESOURCE-ID]\n"
+		"              [-i [start,end]:[start,end]...]\n"
 		"\n"
 		"WCET and PERIOD are milliseconds, DURATION is seconds.\n"
 		"CRITICAL SECTION LENGTH is in milliseconds.\n");
@@ -102,12 +109,42 @@ static void get_exec_times(const char *file, const int column,
 static int num[NUMS];
 static char* progname;
 
+static int randrange(const int max)
+{
+	return (rand() / (RAND_MAX / max + 1));
+}
+
+static void sattolo(unsigned long *items, const unsigned long len)
+{
+	unsigned long i;
+	/* first set up 0, 1, ..., n - 1 */
+	for (i = 0; i < len; i++)
+		items[i] = i;
+	/* note: i is now n */
+	while (1 < i--) {
+		/* 0 <= j < i */
+		int t, j = randrange(i);
+		t = items[i];
+		items[i] = items[j];
+		items[j] = t;
+	}
+}
+
 static int loop_once(void)
 {
 	int i, j = 0;
 	for (i = 0; i < NUMS; i++)
 		j += num[i]++;
 	return j;
+/*
+	int i, tmp;
+	for (i = 0; i < NUM_ITEMS; i++) {
+		tmp = pages[access_order[i]];
+		if (access_order[i] % 3 == 0)
+			pages[access_order[i]] = i+tmp;
+	}
+	return 1;
+*/
 }
 
 static int loop_for(double exec_time, double emergency_exit)
@@ -136,11 +173,11 @@ static int loop_for(double exec_time, double emergency_exit)
 }
 
 
-static void debug_delay_loop(void)
+static void debug_delay_loop(int count)
 {
 	double start, end, delay;
 
-	while (1) {
+	while (count--) {
 		for (delay = 0.5; delay > 0.01; delay -= 0.01) {
 			start = wctime();
 			loop_for(delay, 0);
@@ -184,17 +221,72 @@ static int job(double exec_time, double program_end, int lock_od, double cs_leng
 	}
 }
 
-#define OPTSTR "p:c:wlveo:f:s:q:r:X:L:Q:v"
+struct lt_interval* parse_td_intervals(int num, char* optarg, unsigned int *num_intervals)
+{
+	int i, matched;
+	struct lt_interval *slots = malloc(sizeof(slots[0]) * num);
+	char** arg = (char**)malloc(sizeof(char*) * num);
+	char *token, *saveptr;
+	double start, end;
+	
+	for (i = 0; i < num; i++) {
+		arg[i] = (char*)malloc(sizeof(char)*100);
+	}
+	
+	i = 0;
+	token = strtok_r(optarg, ":", &saveptr);
+	while(token != NULL) {
+		sprintf(arg[i++], "%s", token);
+		token = strtok_r(NULL, ":", &saveptr);
+	}
+	
+	*num_intervals = 0;
+	
+	for (i=0; i<num; i++) {
+		matched = sscanf(arg[i], "[%lf,%lf]", &start, &end);
+		if (matched != 2) {
+			fprintf(stderr, "could not parse '%s' as interval\n", arg[i]);
+			exit(5);
+		}
+		if (start < 0) {
+			fprintf(stderr, "interval %s: must not start before zero\n", arg[i]);
+			exit(5);
+		}
+		if (end <= start) {
+			fprintf(stderr, "interval %s: end before start\n", arg[i]);
+			exit(5);
+		}
+
+		slots[i].start = ms2ns(start);
+		slots[i].end   = ms2ns(end);
+
+		if (i > 0 && slots[i - 1].end >= slots[i].start) {
+			fprintf(stderr, "interval %s: overlaps with previous interval\n", arg[i]);
+			exit(5);
+		}
+
+		(*num_intervals)++;
+	}
+	
+	for (i=0; i<num; i++) {
+		free(arg[i]);
+	}
+	free(arg);
+	return slots;
+}
+
+#define OPTSTR "p:c:wlveo:f:s:q:X:L:Q:vh:m:i:b:"
 int main(int argc, char** argv)
 {
 	int ret;
 	lt_t wcet;
 	lt_t period;
-	double wcet_ms, period_ms;
+	lt_t hyperperiod;
+	lt_t budget;
+	double wcet_ms, period_ms, hyperperiod_ms, budget_ms;
 	unsigned int priority = LITMUS_NO_PRIORITY;
 	int migrate = 0;
 	int cluster = 0;
-	int reservation = -1;
 	int opt;
 	int wait = 0;
 	int test_loop = 0;
@@ -207,6 +299,10 @@ int main(int argc, char** argv)
 	task_class_t class = RT_CLASS_HARD;
 	int cur_job = 0, num_jobs = 0;
 	struct rt_task param;
+	struct mc2_task mc2_param;
+	struct reservation_config config;
+	int res_type = PERIODIC_POLLING;
+	int n_str, num_int = 0;
 
 	int verbose = 0;
 	unsigned int job_no;
@@ -220,6 +316,16 @@ int main(int argc, char** argv)
 
 	progname = argv[0];
 
+	/* default for reservation */
+	config.id = 0;
+	config.priority = LITMUS_NO_PRIORITY; /* use EDF by default */
+	config.cpu = -1;
+	
+	mc2_param.crit = CRIT_LEVEL_C;
+	
+	hyperperiod_ms = 1000;
+	budget_ms = 10;
+	
 	while ((opt = getopt(argc, argv, OPTSTR)) != -1) {
 		switch (opt) {
 		case 'w':
@@ -228,9 +334,7 @@ int main(int argc, char** argv)
 		case 'p':
 			cluster = atoi(optarg);
 			migrate = 1;
-			break;
-		case 'r':
-			reservation = atoi(optarg);
+			config.cpu = cluster;
 			break;
 		case 'q':
 			priority = atoi(optarg);
@@ -275,6 +379,22 @@ int main(int argc, char** argv)
 		case 'v':
 			verbose = 1;
 			break;
+		case 'm':
+			mc2_param.crit = atoi(optarg);
+			if (mc2_param.crit < CRIT_LEVEL_A || mc2_param.crit == NUM_CRIT_LEVELS) {
+				usage("Invalid criticality level.");
+			}
+			res_type = PERIODIC_POLLING;
+			break;
+		case 'h':
+			hyperperiod_ms = atof(optarg);
+			break;
+		case 'b':
+			budget_ms = atof(optarg);
+			break;
+		case 'i':
+			config.priority = atoi(optarg);
+			break;
 		case ':':
 			usage("Argument missing.");
 			break;
@@ -286,9 +406,12 @@ int main(int argc, char** argv)
 	}
 
 	if (test_loop) {
-		debug_delay_loop();
+		debug_delay_loop(1);
 		return 0;
 	}
+
+	if (mc2_param.crit > CRIT_LEVEL_A && config.priority != LITMUS_NO_PRIORITY)
+		usage("Bad criticailty level or priority");
 
 	srand(getpid());
 
@@ -316,6 +439,9 @@ int main(int argc, char** argv)
 
 	wcet   = ms2ns(wcet_ms);
 	period = ms2ns(period_ms);
+	budget = ms2ns(budget_ms);
+	hyperperiod = ms2ns(hyperperiod_ms);
+	
 	if (wcet <= 0)
 		usage("The worst-case execution time must be a "
 				"positive number.");
@@ -337,32 +463,66 @@ int main(int argc, char** argv)
 			bail_out("could not migrate to target partition or cluster.");
 	}
 
+	/* reservation config */
+	config.id = gettid();
+	
+	if (hyperperiod%period != 0 ) {
+		;//bail_out("hyperperiod must be multiple of period");
+	}
+	
+	config.polling_params.budget = budget;
+	config.polling_params.period = period;
+	config.polling_params.offset = 0;
+	config.polling_params.relative_deadline = 0;
+	if (config.polling_params.budget > config.polling_params.period) {
+		usage("The budget must not exceed the period.");
+	}
+	
+	/* create a reservation */
+	ret = reservation_create(res_type, &config);
+	if (ret < 0) {
+		bail_out("failed to create reservation.");
+	}
+	
 	init_rt_task_param(&param);
 	param.exec_cost = wcet;
 	param.period = period;
 	param.priority = priority;
 	param.cls = class;
+	param.release_policy = TASK_PERIODIC;
 	param.budget_policy = (want_enforcement) ?
 			PRECISE_ENFORCEMENT : NO_ENFORCEMENT;
 	if (migrate) {
-		if (reservation >= 0)
-			param.cpu = reservation;
-		else
-			param.cpu = domain_to_first_cpu(cluster);
+		param.cpu = gettid();
 	}
 	ret = set_rt_task_param(gettid(), &param);
+//printf("SET_RT_TASK\n");
 	if (ret < 0)
 		bail_out("could not setup rt task params");
+	
+	mc2_param.res_id = gettid();
+	ret = set_mc2_task_param(gettid(), &mc2_param);
+//printf("SET_MC2_TASK\n");
+	if (ret < 0)
+		bail_out("could not setup mc2 task params");
+
+	pages = (int*)malloc(sizeof(int)*NUM_ITEMS);
+	access_order = (unsigned long*)malloc(sizeof(unsigned long)*NUM_ITEMS);
+	sattolo(access_order, NUM_ITEMS);
 
 	init_litmus();
+printf("CALL\n");
+	set_page_color(config.cpu);
+printf("CALL\n");
 
+//printf("INIT_LITMUS\n");
 	start = wctime();
 	ret = task_mode(LITMUS_RT_TASK);
+//printf("TASK_MODE\n");
 	if (ret != 0)
 		bail_out("could not become RT task");
 
 	if (protocol >= 0) {
-		/* open reference to semaphore */
 		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &cluster);
 		if (lock_od < 0) {
 			perror("litmus_open_lock");
@@ -372,6 +532,7 @@ int main(int argc, char** argv)
 
 
 	if (wait) {
+//printf("BEFORE WAIT\n");
 		ret = wait_for_ts_release();
 		if (ret != 0)
 			bail_out("wait_for_ts_release()");
@@ -379,9 +540,7 @@ int main(int argc, char** argv)
 	}
 
 	if (file) {
-		/* use times read from the CSV file */
 		for (cur_job = 0; cur_job < num_jobs; ++cur_job) {
-			/* convert job's length to seconds */
 			job(exec_times[cur_job] * 0.001 * scale,
 			    start + duration,
 			    lock_od, cs_length * 0.001);
@@ -393,11 +552,10 @@ int main(int argc, char** argv)
 				printf("rtspin/%d:%u @ %.4fms\n", gettid(),
 					job_no, (wctime() - start) * 1000);
 			}
-			/* convert to seconds and scale */
 		} while (job(wcet_ms * 0.001 * scale, start + duration,
 			   lock_od, cs_length * 0.001));
 	}
-
+printf("BEFORE BACK_TASK\n");
 	ret = task_mode(BACKGROUND_TASK);
 	if (ret != 0)
 		bail_out("could not become regular task (huh?)");
@@ -405,5 +563,12 @@ int main(int argc, char** argv)
 	if (file)
 		free(exec_times);
 
+	reservation_destroy(gettid(), config.cpu);
+	
+printf("CALL\n");
+	set_page_color(config.cpu);
+printf("CALL\n");
+	free(pages);
+	free(access_order);
 	return 0;
 }

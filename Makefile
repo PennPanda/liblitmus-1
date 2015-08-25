@@ -19,7 +19,7 @@ LITMUS_KERNEL ?= ../litmus-rt
 # Internal configuration.
 
 # compiler flags
-flags-debug    = -O2 -Wall -Werror -g -Wdeclaration-after-statement
+flags-debug    = -O0 -Wall -g -Wdeclaration-after-statement
 flags-api      = -D_XOPEN_SOURCE=600 -D_GNU_SOURCE
 
 # architecture-specific flags
@@ -73,7 +73,8 @@ AR  := ${CROSS_COMPILE}${AR}
 
 all     = lib ${rt-apps}
 rt-apps = cycles base_task rt_launch rtspin release_ts measure_syscall \
-	  base_mt_task uncache runtests resctrl
+	  base_mt_task uncache runtests resctrl mc2spin mc2pollute  \
+	  mc2syn memthrash mc2sys mc2thrash mc2thrash0 mc2thrash1 mc2thrash2
 
 .PHONY: all lib clean dump-config TAGS tags cscope help doc
 
@@ -168,7 +169,8 @@ litmus-headers = \
 	include/litmus/rt_param.h \
 	include/litmus/fpmath.h \
 	include/litmus/unistd_32.h \
-	include/litmus/unistd_64.h
+	include/litmus/unistd_64.h \
+	include/litmus/mc2_common.h
 
 unistd-headers = \
   $(foreach file,${unistd-${ARCH}},arch/${include-${ARCH}}/include/$(file))
@@ -236,7 +238,32 @@ lib-measure_syscall = -lm
 
 obj-resctrl = resctrl.o
 
+obj-mc2spin = mc2spin.o common.o
+lib-mc2spin = -lrt -static
 
+obj-mc2pollute = mc2pollute.o common.o
+lib-mc2pollute = -lrt -static
+
+obj-mc2sys = mc2sys.o common.o
+lib-mc2sys = -lrt -static
+
+obj-mc2syn = mc2syn.o common.o
+lib-mc2syn = -lrt -static
+
+obj-mc2thrash = mc2thrash.o common.o
+lib-mc2thrash = -lrt -static
+
+obj-mc2thrash0 = mc2thrash.o common.o
+lib-mc2thrash0 = -lrt -static
+
+obj-mc2thrash1 = mc2thrash.o common.o
+lib-mc2thrash1 = -lrt -static
+
+obj-mc2thrash2 = mc2thrash.o common.o
+lib-mc2thrash2 = -lrt -static
+
+obj-memthrash = memthrash.o
+lib-memthrash = -lrt
 # ##############################################################################
 # Build everything that depends on liblitmus.
 

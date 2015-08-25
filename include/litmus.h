@@ -40,6 +40,8 @@ extern "C" {
 
 #include "migration.h"
 
+#include "litmus/mc2_common.h"
+
 /**
  * @private
  * Number of semaphore protocol object types
@@ -420,6 +422,9 @@ int reservation_create(int rtype, void *config);
 
 int reservation_destroy(unsigned int reservation_id, int cpu);
 
+int set_mc2_task_param(pid_t pid, struct mc2_task* param);
+
+int set_page_color(int cpu);
 
 #ifdef __cplusplus
 }

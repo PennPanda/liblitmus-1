@@ -1,4 +1,5 @@
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,10 +9,155 @@
 #include <assert.h>
 #include <limits.h>
 
+
 #include "litmus.h"
 #include "common.h"
+#include "cache_common.h"
+
+#define PAGE_SIZE (4096)
+
+#define CACHELINE_SIZE 32
+#define INTS_IN_CACHELINE (CACHELINE_SIZE/sizeof(int))
+#define ARENA_SIZE_KB 64
+#define CACHELINES_IN_1KB (1024 / sizeof(cacheline_t))
+#define INTS_IN_1KB	(1024 / sizeof(int))
+#define NUM_ARENA_ELEM	((ARENA_SIZE_KB * 1024)/sizeof(cacheline_t))
+
+//static int wss = ARENA_SIZE_KB;
+static int loops = 10;
+
+static cacheline_t* arena = NULL;
+
+struct timeval tm1, tm2;
+
+typedef int (*walk_t)(cacheline_t *mem, int wss, int write_cycle);
+typedef cacheline_t* (*walk_start_t)(int wss);
+
+struct walk_method
+{
+	const walk_t walk;
+	const walk_start_t walk_start;
+};
+
+static int sequential_walk(cacheline_t *_mem, int wss, int write_cycle)
+{
+	int sum = 0, i;
+	int* mem = (int*)_mem; /* treat as raw buffer of ints */
+	int num_ints = wss * INTS_IN_1KB;
+
+	if (write_cycle > 0) {
+		for (i = 0; i < num_ints; i++) {
+			if (i % write_cycle == (write_cycle - 1))
+				mem[i]++;
+			else
+				sum += mem[i];
+		}
+	} else {
+		/* sequential access, pure read */
+		for (i = 0; i < num_ints; i++)
+			sum += mem[i];
+	}
+	return sum;
+}
+
+static cacheline_t* sequential_start(int wss)
+{
+	static int pos = 0;
+
+	int num_cachelines = wss * CACHELINES_IN_1KB;
+
+	cacheline_t *mem;
+
+	/* Don't allow re-use between allocations.
+	 * At most half of the arena may be used
+	 * at any one time.
+	 */
+	//if (num_cachelines * 2 > NUM_ARENA_ELEM)
+		//die("static memory arena too small");
+
+	if (pos + num_cachelines > ((wss * 1024)/sizeof(cacheline_t))) {
+		/* wrap to beginning */
+		mem = arena;
+		pos = num_cachelines;
+	} else {
+		mem = arena + pos;
+		pos += num_cachelines;
+	}
+
+	return mem;
+}
+
+static const struct walk_method sequential_method =
+{
+	.walk = sequential_walk,
+	.walk_start = sequential_start
+};
 
 
+/* Random walk around the arena in cacheline-sized chunks.
+   Cacheline-sized chucks ensures the same utilization of each
+   hit line as sequential read. (Otherwise, our utilization
+   would only be 1/INTS_IN_CACHELINE.) */
+static int random_walk(cacheline_t *mem, int wss, int write_cycle)
+{
+	/* a random cycle among the cache lines was set up by init_arena(). */
+	int sum, i, j, next, which_line;
+
+	int numlines = wss * CACHELINES_IN_1KB;
+
+	sum = 0;
+
+	/* contents of arena is structured s.t. offsets are all
+	   w.r.t. to start of arena, so compute the initial offset */
+	next = mem - arena;
+
+	if (write_cycle == 0) {
+		for (i = 0; i < numlines; i++) {
+			which_line = next;
+			/* every element in the cacheline has the same value */
+			for(j = 0; j < INTS_IN_CACHELINE; j++) {
+				next = arena[which_line].line[j];
+				sum += next;
+			}
+		}
+	}
+	
+	else {
+		int w;
+		for (i = 0, w = 0; i < numlines; i++) {
+			which_line = next;
+			/* count down s.t. next has value of 0th int
+			   when the loop exits */
+			for(j = 0; j < INTS_IN_CACHELINE; j++) {
+				next = arena[which_line].line[j];
+				if((w % write_cycle) != (write_cycle - 1)) {
+					sum += next;
+				}
+				else {
+					/* Write back what we just read. We can't write back a
+					   different value without destroying the walk-cycle, so
+					   cast the write to volatile to ensure the write is
+					   performed. Note: Volatiles are still cached. */
+					((volatile cacheline_t*)arena)[which_line].line[j] = next;
+				}
+			}
+		}
+	}
+	return sum;
+}
+
+static cacheline_t* random_start(int wss)
+{
+	return arena + randrange(0, ((wss * 1024)/sizeof(cacheline_t)));
+}
+
+static const struct walk_method random_method =
+{
+	.walk = random_walk,
+	.walk_start = random_start
+};
+
+static volatile int dont_optimize_me = 0;
 
 static void usage(char *error) {
 	fprintf(stderr, "Error: %s\n", error);
@@ -22,8 +168,9 @@ static void usage(char *error) {
 		"	rt_spin -l\n"
 		"\n"
 		"COMMON-OPTS = [-w] [-s SCALE]\n"
-		"              [-p PARTITION/CLUSTER [-z CLUSTER SIZE]] [-c CLASS]\n"
-		"              [-X LOCKING-PROTOCOL] [-L CRITICAL SECTION LENGTH] [-Q RESOURCE-ID]"
+		"              [-p PARTITION/CLUSTER [-z CLUSTER SIZE]] [-c CLASS] [-m CRITICALITY LEVEL]\n"
+		"              [-X LOCKING-PROTOCOL] [-L CRITICAL SECTION LENGTH] [-Q RESOURCE-ID]\n"
+		"              [-i [start,end]:[start,end]...]\n"
 		"\n"
 		"WCET and PERIOD are milliseconds, DURATION is seconds.\n"
 		"CRITICAL SECTION LENGTH is in milliseconds.\n");
@@ -98,29 +245,35 @@ static void get_exec_times(const char *file, const int column,
 	fclose(fstream);
 }
 
-#define NUMS 4096
-static int num[NUMS];
 static char* progname;
 
-static int loop_once(void)
+static int loop_once(int wss)
 {
-	int i, j = 0;
-	for (i = 0; i < NUMS; i++)
-		j += num[i]++;
-	return j;
+	cacheline_t *mem;
+	int temp;
+	
+	//mem = random_method.walk_start(wss);
+	//temp = random_method.walk(mem, wss, 0);
+	mem = sequential_method.walk_start(wss);
+	temp = sequential_method.walk(mem, wss, 0);
+	dont_optimize_me = temp;
+	
+	return dont_optimize_me;
 }
 
-static int loop_for(double exec_time, double emergency_exit)
+static int loop_for(int wss, double exec_time, double emergency_exit)
 {
 	double last_loop = 0, loop_start;
 	int tmp = 0;
+	int cur_loop = 0;
 
 	double start = cputime();
 	double now = cputime();
 
-	while (now + last_loop < start + exec_time) {
+	//while (now + last_loop < start + exec_time) {
+	while(cur_loop++ < loops) {
 		loop_start = now;
-		tmp += loop_once();
+		tmp = loop_once(wss);
 		now = cputime();
 		last_loop = now - loop_start;
 		if (emergency_exit && wctime() > emergency_exit) {
@@ -136,14 +289,14 @@ static int loop_for(double exec_time, double emergency_exit)
 }
 
 
-static void debug_delay_loop(void)
+static void debug_delay_loop(int wss)
 {
 	double start, end, delay;
 
 	while (1) {
 		for (delay = 0.5; delay > 0.01; delay -= 0.01) {
 			start = wctime();
-			loop_for(delay, 0);
+			loop_for(wss, delay, 0);
 			end = wctime();
 			printf("%6.4fs: looped for %10.8fs, delta=%11.8fs, error=%7.4f%%\n",
 			       delay,
@@ -154,7 +307,7 @@ static void debug_delay_loop(void)
 	}
 }
 
-static int job(double exec_time, double program_end, int lock_od, double cs_length)
+static int job(int wss, double exec_time, double program_end, int lock_od, double cs_length)
 {
 	double chunk1, chunk2;
 
@@ -167,34 +320,43 @@ static int job(double exec_time, double program_end, int lock_od, double cs_leng
 			chunk2 = exec_time - cs_length - chunk1;
 
 			/* non-critical section */
-			loop_for(chunk1, program_end + 1);
+			loop_for(wss, chunk1, program_end + 1);
 
 			/* critical section */
 			litmus_lock(lock_od);
-			loop_for(cs_length, program_end + 1);
+			loop_for(wss, cs_length, program_end + 1);
 			litmus_unlock(lock_od);
 
 			/* non-critical section */
-			loop_for(chunk2, program_end + 2);
+			loop_for(wss, chunk2, program_end + 2);
 		} else {
-			loop_for(exec_time, program_end + 1);
+			register unsigned long t;
+			register unsigned long overhead = get_cyclecount();
+			overhead = get_cyclecount() - overhead;
+			
+			//gettimeofday(&tm1, NULL);
+			t = get_cyclecount();
+			loop_for(wss, exec_time, program_end + 1);
+			t = get_cyclecount() - t;
+			printf("%ld cycles (%ld overhead))\n", t, overhead);
+			//gettimeofday(&tm2, NULL);
+			//printf("%ld\n", ((tm2.tv_sec * 1000000 + tm2.tv_usec) - (tm1.tv_sec * 1000000 + tm1.tv_usec)));
 		}
 		sleep_next_period();
 		return 1;
 	}
 }
 
-#define OPTSTR "p:c:wlveo:f:s:q:r:X:L:Q:v"
+#define OPTSTR "p:c:wl:veo:f:s:q:X:L:Q:vh:k:"
 int main(int argc, char** argv)
 {
-	int ret;
+	int ret, i;
 	lt_t wcet;
 	lt_t period;
 	double wcet_ms, period_ms;
 	unsigned int priority = LITMUS_NO_PRIORITY;
 	int migrate = 0;
 	int cluster = 0;
-	int reservation = -1;
 	int opt;
 	int wait = 0;
 	int test_loop = 0;
@@ -207,9 +369,11 @@ int main(int argc, char** argv)
 	task_class_t class = RT_CLASS_HARD;
 	int cur_job = 0, num_jobs = 0;
 	struct rt_task param;
-
+	int n_str, num_int = 0;
+	size_t arena_sz;
 	int verbose = 0;
 	unsigned int job_no;
+	int wss;
 
 	/* locking */
 	int lock_od = -1;
@@ -229,9 +393,6 @@ int main(int argc, char** argv)
 			cluster = atoi(optarg);
 			migrate = 1;
 			break;
-		case 'r':
-			reservation = atoi(optarg);
-			break;
 		case 'q':
 			priority = atoi(optarg);
 			if (!litmus_is_valid_fixed_prio(priority))
@@ -246,7 +407,10 @@ int main(int argc, char** argv)
 			want_enforcement = 1;
 			break;
 		case 'l':
-			test_loop = 1;
+			loops = atoi(optarg);
+			break;
+		case 'k':
+			wss = atoi(optarg);
 			break;
 		case 'o':
 			column = atoi(optarg);
@@ -286,7 +450,7 @@ int main(int argc, char** argv)
 	}
 
 	if (test_loop) {
-		debug_delay_loop();
+		debug_delay_loop(wss);
 		return 0;
 	}
 
@@ -336,7 +500,7 @@ int main(int argc, char** argv)
 		if (ret < 0)
 			bail_out("could not migrate to target partition or cluster.");
 	}
-
+	
 	init_rt_task_param(&param);
 	param.exec_cost = wcet;
 	param.period = period;
@@ -345,16 +509,22 @@ int main(int argc, char** argv)
 	param.budget_policy = (want_enforcement) ?
 			PRECISE_ENFORCEMENT : NO_ENFORCEMENT;
 	if (migrate) {
-		if (reservation >= 0)
-			param.cpu = reservation;
-		else
-			param.cpu = domain_to_first_cpu(cluster);
+		param.cpu = domain_to_first_cpu(cluster);
 	}
 	ret = set_rt_task_param(gettid(), &param);
 	if (ret < 0)
 		bail_out("could not setup rt task params");
-
-	init_litmus();
+	
+	
+	arena_sz = wss*1024;
+	arena = alloc_arena(arena_sz, 0, 0);
+	init_arena(arena, arena_sz);
+	
+	lock_memory();
+	
+	ret = init_litmus();
+	if (ret != 0)
+		bail_out("init_litmus() failed\n");
 
 	start = wctime();
 	ret = task_mode(LITMUS_RT_TASK);
@@ -362,7 +532,6 @@ int main(int argc, char** argv)
 		bail_out("could not become RT task");
 
 	if (protocol >= 0) {
-		/* open reference to semaphore */
 		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &cluster);
 		if (lock_od < 0) {
 			perror("litmus_open_lock");
@@ -379,10 +548,8 @@ int main(int argc, char** argv)
 	}
 
 	if (file) {
-		/* use times read from the CSV file */
 		for (cur_job = 0; cur_job < num_jobs; ++cur_job) {
-			/* convert job's length to seconds */
-			job(exec_times[cur_job] * 0.001 * scale,
+			job(wss, exec_times[cur_job] * 0.001 * scale,
 			    start + duration,
 			    lock_od, cs_length * 0.001);
 		}
@@ -393,8 +560,7 @@ int main(int argc, char** argv)
 				printf("rtspin/%d:%u @ %.4fms\n", gettid(),
 					job_no, (wctime() - start) * 1000);
 			}
-			/* convert to seconds and scale */
-		} while (job(wcet_ms * 0.001 * scale, start + duration,
+		} while (job(wss, wcet_ms * 0.001 * scale, start + duration,
 			   lock_od, cs_length * 0.001));
 	}
 
@@ -405,5 +571,6 @@ int main(int argc, char** argv)
 	if (file)
 		free(exec_times);
 
+	dealloc_arena(arena, arena_sz);
 	return 0;
 }
